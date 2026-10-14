@@ -58,6 +58,7 @@ Credentials are never copied: log in once per profile with `omp --profile <name>
 | Skill | Use | Origin |
 |---|---|---|
 | `agent-kit` | Tells any session how to use this kit: new profiles, new skills, shadowing | original |
+| `coordinator` | Top-level owner for multi-step and multi-agent work: anchors, worker briefs, independent verification, debugging loop, blinded agent evaluation | original method; evaluation from pstack (MIT), debugging from mattpocock/skills (MIT) |
 | `blast-radius` | Prove what a change could break outside its diff | cursor/plugins pstack (MIT) |
 | `unslop` | Tighten prose without changing meaning | cursor/plugins pstack (MIT) |
 | `task-contract` | Make scope, sources, acceptance and continuation explicit | original |
