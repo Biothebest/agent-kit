@@ -1,0 +1,24 @@
+# agent-kit OMP profile baseline. `agent-kit profile init <name>` copies this into
+# ~/.omp/profiles/<name>/agent/config.yml only when that file does not exist yet.
+# Model roles are left to /model so each profile picks its own provider.
+symbolPreset: unicode
+steeringMode: one-at-a-time
+followUpMode: one-at-a-time
+interruptMode: wait
+composer:
+  shape: band
+display:
+  subagentLivePreview: true
+  showTokenUsage: true
+  showTurnTime: true
+task:
+  maxConcurrency: 4
+  maxRecursionDepth: 1
+  enableLsp: true
+  showResolvedModelBadge: true
+prewalk:
+  enabled: false
+autolearn:
+  enabled: true
+error:
+  notify: "on"

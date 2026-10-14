@@ -1,0 +1,19 @@
+{
+  "servers": {
+    "typescript-language-server": {
+      "rootMarkers": ["package.json", "tsconfig.json", "jsconfig.json", "*.js", "*.mjs", "*.cjs", "*.ts", "*.tsx", "*.jsx", "*.html"]
+    },
+    "vscode-html-language-server": {
+      "rootMarkers": ["package.json", ".git", "*.html"]
+    },
+    "vscode-css-language-server": {
+      "rootMarkers": ["package.json", ".git", "*.css", "*.scss", "*.less"]
+    },
+    "vscode-json-language-server": {
+      "rootMarkers": ["package.json", ".git", "*.json"]
+    },
+    "pyright": {
+      "rootMarkers": ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "*.py"]
+    }
+  }
+}

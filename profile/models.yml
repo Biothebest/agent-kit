@@ -1,0 +1,22 @@
+# Local Ollama server (http://127.0.0.1:11434). Keyless and offline.
+# Gemma uses /v1/chat/completions; EmbeddingGemma 2 uses /v1/embeddings
+# (see skills/local-embeddinggemma). Delete entries for models you have not pulled.
+providers:
+  ollama:
+    baseUrl: http://127.0.0.1:11434
+    api: openai-responses
+    auth: none
+    discovery:
+      type: ollama
+    models:
+      - id: "gemma4:12b"
+        name: Gemma 4 12B (local)
+        api: openai-completions
+        baseUrl: http://127.0.0.1:11434/v1
+        reasoning: true
+        input: [text, image]
+      - id: "embeddinggemma-2:latest"
+        name: EmbeddingGemma 2 (local)
+        api: openai-embeddings
+        baseUrl: http://127.0.0.1:11434/v1
+        input: [text, image]

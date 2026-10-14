@@ -1,0 +1,4 @@
+#!/bin/sh
+# Refuse a push whose outgoing commits carry a private term, credential shape,
+# home path or non-text file. Enable once per clone: git config core.hooksPath .githooks
+exec "$(git rev-parse --show-toplevel)/agent-kit" audit --pre-push

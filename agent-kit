@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""agent-kit: one skill library and OMP profile baseline for every agent harness.
+
+Skills live once in ./skills and are symlinked into each harness's user skill
+directory, so every OMP profile (including new ones), Codex and Claude Code load
+the same files. ./profile holds a baseline for new OMP profiles.
+"""
+
+from __future__ import annotations
+
+import argparse
+import itertools
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+KIT = Path(__file__).resolve().parent
+SKILLS = KIT / "skills"
+PROFILE_TEMPLATE = KIT / "profile"
+PRIVATE_TERMS_ENV = "AGENT_KIT_PRIVATE_TERMS"
+
+# Harness -> user-level skill directory, relative to $HOME.
+# ~/.agents/skills is read by every OMP profile and by Codex.
+HARNESSES: Dict[str, Tuple[str, str]] = {
+    "agents": (".agents/skills", "OMP (every profile) and Codex"),
+    "claude": (".claude/skills", "Claude Code"),
+}
+
+NAME = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+SPEC_KEYS = {"name", "description", "license", "compatibility", "metadata", "allowed-tools"}
+# Generic leak patterns; personal terms come from the local, untracked terms file.
+GENERIC_LEAKS = [
+    (re.compile(r"/(?:Users|home)/[A-Za-z0-9._-]+/"), "absolute home path"),
+    (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "private key"),
+    (re.compile(r"\b(?:ghp|gho|ghs|github_pat)_[A-Za-z0-9_]{20,}"), "GitHub token"),
+    (re.compile(r"\bsk-[A-Za-z0-9_-]{20,}"), "API key"),
+    (re.compile(r"\bxox[abpr]-[A-Za-z0-9-]{10,}"), "Slack token"),
+    (re.compile(r"[A-Za-z0-9._%+-]+@(?!users\.noreply\.github\.com)[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "email address"),
+]
+
+
+class KitError(Exception):
+    """A request the kit refuses to carry out."""
+
+
+# ---------------------------------------------------------------- skills ---
+
+
+def _scalar(raw: str) -> str:
+    raw = raw.strip()
+    if raw.startswith('"'):
+        return json.loads(raw)
+    if raw.startswith("'") and raw.endswith("'") and len(raw) >= 2:
+        return raw[1:-1].replace("''", "'")
+    return raw
+
+
+def frontmatter(text: str) -> Dict[str, object]:
+    """Parse the YAML subset SKILL.md frontmatter uses: scalars plus one-level maps."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        raise KitError("missing opening '---'")
+    try:
+        end = lines.index("---", 1)
+    except ValueError:
+        raise KitError("missing closing '---'") from None
+    data: Dict[str, object] = {}
+    current: Optional[Dict[str, str]] = None
+    for line in lines[1:end]:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        indented = line[0] in " \t"
+        key, sep, value = line.strip().partition(":")
+        if not sep:
+            raise KitError(f"unparseable frontmatter line: {line.strip()!r}")
+        if indented:
+            if current is None:
+                raise KitError(f"indented line outside a map: {line.strip()!r}")
+            current[key.strip()] = _scalar(value)
+            continue
+        key = key.strip()
+        if key in data:
+            raise KitError(f"duplicate key: {key}")
+        if value.strip():
+            data[key] = _scalar(value)
+            current = None
+        else:
+            current = {}
+            data[key] = current
+    return data
+
+
+def validate_skill(directory: Path) -> List[str]:
+    """Agent Skills specification checks that every target harness relies on."""
+    path = directory / "SKILL.md"
+    if not path.is_file():
+        return ["missing SKILL.md"]
+    try:
+        meta = frontmatter(path.read_text(encoding="utf-8"))
+    except (KitError, ValueError) as exc:
+        return [str(exc)]
+    errors = []
+    unknown = sorted(set(meta) - SPEC_KEYS)
+    if unknown:
+        errors.append(f"non-spec frontmatter keys: {', '.join(unknown)}")
+    name = meta.get("name")
+    if not isinstance(name, str) or not NAME.match(name) or len(name) > 64:
+        errors.append("name must be 1-64 lowercase letters, digits and single hyphens")
+    elif name != directory.name:
+        errors.append(f"name {name!r} does not match directory {directory.name!r}")
+    description = meta.get("description")
+    if not isinstance(description, str) or not 1 <= len(description) <= 1024:
+        errors.append("description must be 1-1024 characters")
+    compatibility = meta.get("compatibility")
+    if compatibility is not None and (
+        not isinstance(compatibility, str) or not 1 <= len(compatibility) <= 500
+    ):
+        errors.append("compatibility must be 1-500 characters")
+    metadata = meta.get("metadata")
+    if metadata is not None and not (
+        isinstance(metadata, dict) and all(isinstance(v, str) for v in metadata.values())
+    ):
+        errors.append("metadata must map strings to strings")
+    return errors
+
+
+def kit_skills() -> Dict[str, Path]:
+    return {
+        p.name: p
+        for p in sorted(SKILLS.iterdir())
+        if p.is_dir() and not p.name.startswith(".")
+    }
+
+
+def checked_skills() -> Dict[str, Path]:
+    skills = kit_skills()
+    problems = {name: validate_skill(path) for name, path in skills.items()}
+    bad = {name: errs for name, errs in problems.items() if errs}
+    if bad:
+        detail = "; ".join(f"{name}: {', '.join(errs)}" for name, errs in bad.items())
+        raise KitError(f"invalid skills, nothing linked: {detail}")
+    return skills
+
+
+# ----------------------------------------------------------------- links ---
+
+
+def _target_dir(harness: str) -> Path:
+    return Path.home() / HARNESSES[harness][0]
+
+
+def _points_into_kit(link: Path) -> bool:
+    target = Path(os.readlink(link))
+    if not target.is_absolute():
+        target = link.parent / target
+    try:
+        target.resolve(strict=False).relative_to(SKILLS.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def link(harnesses: List[str]) -> int:
+    skills = checked_skills()
+    conflicts = 0
+    for harness in harnesses:
+        root = _target_dir(harness)
+        root.mkdir(parents=True, exist_ok=True)
+        for name, source in skills.items():
+            entry = root / name
+            if entry.is_symlink():
+                if entry.resolve() == source.resolve():
+                    print(f"unchanged  {harness:7} {name}")
+                    continue
+                if _points_into_kit(entry):
+                    entry.unlink()
+                    entry.symlink_to(source)
+                    print(f"relinked   {harness:7} {name}")
+                    continue
+            if entry.exists() or entry.is_symlink():
+                conflicts += 1
+                print(f"CONFLICT   {harness:7} {name}: {entry} is not a link into this kit; left untouched")
+                continue
+            entry.symlink_to(source)
+            print(f"linked     {harness:7} {name}")
+        for entry in sorted(root.iterdir()):
+            if entry.is_symlink() and entry.name not in skills and _points_into_kit(entry):
+                entry.unlink()
+                print(f"pruned     {harness:7} {entry.name} (no longer in the kit)")
+    if conflicts:
+        print(f"{conflicts} conflict(s): move or remove those entries, then run link again.")
+    return 1 if conflicts else 0
+
+
+def unlink(harnesses: List[str]) -> int:
+    for harness in harnesses:
+        root = _target_dir(harness)
+        if not root.is_dir():
+            continue
+        for entry in sorted(root.iterdir()):
+            if entry.is_symlink() and _points_into_kit(entry):
+                entry.unlink()
+                print(f"unlinked   {harness:7} {entry.name}")
+    return 0
+
+
+# -------------------------------------------------------------- profiles ---
+
+
+def omp_root() -> Path:
+    configured = os.environ.get("PI_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".omp"
+
+
+def profile_agent_dir(name: str) -> Path:
+    if name == "default":
+        return omp_root() / "agent"
+    if not PROFILE_NAME.match(name):
+        raise KitError(f"invalid profile name: {name!r}")
+    return omp_root() / "profiles" / name / "agent"
+
+
+def template_files() -> List[Path]:
+    return sorted(p for p in PROFILE_TEMPLATE.iterdir() if p.is_file())
+
+
+def profile_init(name: str) -> int:
+    agent = profile_agent_dir(name)
+    agent.mkdir(parents=True, exist_ok=True)
+    for template in template_files():
+        destination = agent / template.name
+        if destination.exists() or destination.is_symlink():
+            print(f"kept       {destination} (exists; compare with {template})")
+            continue
+        shutil.copyfile(template, destination)
+        print(f"wrote      {destination}")
+    print(f"Start it with: omp --profile {name}" if name != "default" else "Start it with: omp")
+    return 0
+
+
+def omp_profiles() -> List[str]:
+    root = omp_root() / "profiles"
+    names = sorted(p.name for p in root.iterdir() if (p / "agent").is_dir()) if root.is_dir() else []
+    return (["default"] if (omp_root() / "agent").is_dir() else []) + names
+
+
+# ---------------------------------------------------------------- doctor ---
+
+
+def _resolve_in_profile(omp: str, profile: str, skill: str, cwd: Path) -> str:
+    result = subprocess.run(
+        [omp, "--profile", profile, "read", f"skill://{skill}"],
+        cwd=cwd,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    first = (result.stdout or result.stderr).splitlines()[:1]
+    match = re.match(r"\[Skill file: (.+)\]$", first[0]) if first else None
+    return match.group(1) if match else ""
+
+
+def doctor(omp_profiles_to_check: List[str], cwd: Optional[Path]) -> int:
+    problems = 0
+    skills = kit_skills()
+    print(f"kit        {KIT} ({len(skills)} skills)")
+    for name, path in skills.items():
+        errors = validate_skill(path)
+        if errors:
+            problems += 1
+            print(f"INVALID    {name}: {'; '.join(errors)}")
+    for harness, (relative, consumers) in HARNESSES.items():
+        root = Path.home() / relative
+        states = {"linked": 0, "missing": 0, "conflict": 0}
+        for name, source in skills.items():
+            entry = root / name
+            if entry.is_symlink() and entry.resolve() == source.resolve():
+                states["linked"] += 1
+            elif entry.exists() or entry.is_symlink():
+                states["conflict"] += 1
+                print(f"CONFLICT   {harness:7} {name}: {entry} is not a kit link")
+            else:
+                states["missing"] += 1
+        print(
+            f"harness    {harness:7} ~/{relative} for {consumers}: "
+            f"{states['linked']} linked, {states['missing']} missing, {states['conflict']} conflicts"
+        )
+        problems += states["conflict"]
+    templates = [p.name for p in template_files()]
+    for profile in omp_profiles():
+        agent = profile_agent_dir(profile)
+        missing = [name for name in templates if not (agent / name).exists()]
+        state = "baseline complete" if not missing else f"missing {', '.join(missing)}"
+        print(f"profile    {profile:12} {state}")
+    if omp_profiles_to_check:
+        omp = shutil.which("omp")
+        if not omp:
+            print("BLOCKED    omp is not on PATH; cannot resolve skills per profile")
+            return 1
+        with tempfile.TemporaryDirectory() as scratch:
+            where = cwd or Path(scratch)
+            for profile in omp_profiles_to_check:
+                for name, source in skills.items():
+                    found = _resolve_in_profile(omp, profile, name, where)
+                    expected = (source / "SKILL.md").resolve()
+                    if not found:
+                        problems += 1
+                        print(f"MISSING    omp:{profile} {name}")
+                    elif Path(found).resolve() != expected:
+                        print(f"shadowed   omp:{profile} {name} -> {found} (higher-precedence skill wins)")
+                print(f"resolved   omp:{profile} from {where}")
+    print("doctor: ok" if not problems else f"doctor: {problems} problem(s)")
+    return 1 if problems else 0
+
+
+# ----------------------------------------------------------------- audit ---
+
+
+def private_terms() -> List[re.Pattern]:
+    path = Path(
+        os.environ.get(PRIVATE_TERMS_ENV)
+        or Path.home() / ".config" / "agent-kit" / "private-terms.txt"
+    )
+    if not path.is_file():
+        return []
+    patterns = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            patterns.append(re.compile(line, re.IGNORECASE))
+    return patterns
+
+
+def _git(root: Path, *args: str, check: bool = True) -> bytes:
+    result = subprocess.run(["git", "-C", str(root), *args], capture_output=True)
+    if check and result.returncode:
+        raise KitError(f"git {' '.join(args)} failed: {result.stderr.decode(errors='replace').strip()}")
+    return result.stdout
+
+
+def _scan(label: str, data: bytes, personal: List[re.Pattern]) -> List[str]:
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return [f"{label}: not UTF-8 text, so it cannot be audited"]
+    findings = []
+    for number, line in enumerate(text.splitlines(), 1):
+        findings += [f"{label}:{number}: {kind}" for pattern, kind in GENERIC_LEAKS if pattern.search(line)]
+        findings += [f"{label}:{number}: private term" for pattern in personal if pattern.search(line)]
+    return findings
+
+
+def _label(raw: bytes) -> str:
+    return raw.decode("utf-8", "backslashreplace")
+
+
+def _worktree_entries(root: Path):
+    """(label, bytes) for every publishable path, link target, file and staged blob."""
+    staged: Dict[bytes, Tuple[str, str]] = {}
+    if (root / ".git").exists():
+        for record in _git(root, "ls-files", "-z", "--stage").split(b"\0"):
+            if record:
+                meta, raw = record.split(b"\t", 1)
+                mode, sha, _ = meta.decode().split()
+                if mode != "160000":  # submodule commits are not blobs
+                    staged[raw] = (mode, sha)
+        others = _git(root, "ls-files", "-z", "--others", "--exclude-standard").split(b"\0")
+        names = sorted(set(staged) | {raw for raw in others if raw})
+    else:
+        names = sorted(
+            os.fsencode(os.path.relpath(os.path.join(base, item), root))
+            for base, dirs, files in os.walk(root)
+            for item in files + [d for d in dirs if os.path.islink(os.path.join(base, d))]
+        )
+    for raw in names:
+        label = _label(raw)
+        path = root / os.fsdecode(raw)
+        yield f"{label} (path)", raw
+        current: Optional[bytes] = None
+        if path.is_symlink():
+            current = os.readlink(os.fsencode(path))
+            yield f"{label} (link target)", current
+        elif path.is_file():
+            current = path.read_bytes()
+            yield label, current
+        if raw in staged:
+            mode, sha = staged[raw]
+            blob = _git(root, "cat-file", "blob", sha)
+            if blob != current:
+                yield f"{label} (staged{' link target' if mode == '120000' else ''})", blob
+
+
+def _commit_entries(root: Path, commits: List[str]):
+    """(label, bytes) for each commit's metadata, paths, link targets and blobs."""
+    seen = set()
+    for commit in commits:
+        short = commit[:7]
+        yield f"{short} (commit metadata)", _git(root, "show", "-s", "--format=%an <%ae>%n%cn <%ce>%n%B", commit)
+        for record in _git(root, "ls-tree", "-r", "-z", "--full-tree", commit).split(b"\0"):
+            if not record:
+                continue
+            meta, path = record.split(b"\t", 1)
+            mode, kind, sha = meta.decode().split()
+            name = _label(path)
+            if (sha, name) in seen or kind != "blob":
+                continue
+            seen.add((sha, name))
+            yield f"{short}:{name} (path)", path
+            label = f"{short}:{name} (link target)" if mode == "120000" else f"{short}:{name}"
+            yield label, _git(root, "cat-file", "blob", sha)
+
+
+def outgoing_commits(root: Path, updates: str) -> List[str]:
+    """Commits a push would publish, from git's pre-push stdin lines."""
+    zero = "0" * 40
+    commits: List[str] = []
+    for line in updates.splitlines():
+        parts = line.split()
+        if len(parts) != 4 or parts[1] == zero:
+            continue
+        local, remote = parts[1], parts[3]
+        # A new remote ref publishes the whole ancestry: other remotes prove nothing.
+        span = [local] if remote == zero else [f"{remote}..{local}"]
+        commits += _git(root, "rev-list", *span).decode().split()
+    return list(dict.fromkeys(commits))
+
+
+def audit(root: Path = KIT, pre_push: Optional[str] = None) -> int:
+    """Refuse publication when a path, link target, file or commit carries a leak.
+
+    Without ``pre_push`` the working tree and every commit reachable from HEAD are
+    scanned; with it, only the commits that push would publish.
+    """
+    personal = private_terms()
+    if not personal:
+        print(
+            "WARNING    no private terms file; only generic leak patterns checked "
+            f"(set {PRIVATE_TERMS_ENV} or create ~/.config/agent-kit/private-terms.txt)"
+        )
+    if pre_push is not None:
+        entries = _commit_entries(root, outgoing_commits(root, pre_push))
+    else:
+        history: List[str] = []
+        if (root / ".git").exists():
+            history = _git(root, "rev-list", "HEAD", check=False).decode().split()
+        entries = itertools.chain(_worktree_entries(root), _commit_entries(root, history))
+    findings = 0
+    for label, data in entries:
+        for finding in _scan(label, data, personal):
+            findings += 1
+            print(f"LEAK       {finding}")
+    print("audit: clean" if not findings else f"audit: {findings} finding(s); nothing is safe to publish")
+    return 1 if findings else 0
+
+
+# ------------------------------------------------------------------- cli ---
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(prog="agent-kit", description=__doc__.splitlines()[0])
+    commands = parser.add_subparsers(dest="command", required=True)
+    for verb, text in (("link", "symlink kit skills into harness skill directories"),
+                       ("unlink", "remove only the kit's symlinks")):
+        sub = commands.add_parser(verb, help=text)
+        sub.add_argument("--harness", action="append", choices=sorted(HARNESSES),
+                         help="limit to one harness (repeatable; default: all)")
+    profile = commands.add_parser("profile", help="OMP profile baseline")
+    profile_commands = profile.add_subparsers(dest="action", required=True)
+    init = profile_commands.add_parser("init", help="write missing baseline files into a profile")
+    init.add_argument("name")
+    check = commands.add_parser("doctor", help="report skill, link and profile state")
+    check.add_argument("--omp-profile", action="append", default=[], metavar="NAME",
+                       help="resolve every kit skill in this OMP profile (repeatable)")
+    check.add_argument("--cwd", type=Path, help="directory to resolve from (default: empty temp dir)")
+    scan = commands.add_parser("audit", help="scan paths, files, link targets and commits for leaks")
+    scan.add_argument("--pre-push", action="store_true",
+                      help="read git pre-push ref updates on stdin; scan only outgoing commits")
+    args = parser.parse_args(argv)
+    try:
+        if args.command == "link":
+            return link(args.harness or sorted(HARNESSES))
+        if args.command == "unlink":
+            return unlink(args.harness or sorted(HARNESSES))
+        if args.command == "profile":
+            return profile_init(args.name)
+        if args.command == "doctor":
+            return doctor(args.omp_profile, args.cwd)
+        return audit(pre_push=sys.stdin.read() if args.pre_push else None)
+    except KitError as exc:
+        print(f"agent-kit: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
